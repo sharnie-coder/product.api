@@ -1,0 +1,269 @@
+1. Complete ProductCreate Validation (20%)
+
+This belongs in models/product.py
+
+class ProductCreate(SQLModel):
+    name: str = Field(min_length=2, max_length=100)
+    description: str = Field(min_length=10, max_length=500)
+    brand: str
+    category: str
+    price: float = Field(gt=0)
+    stock: int = Field(default=0, ge=0)
+    warranty_months: int = Field(default=0, ge=0)
+    sku: str
+    category_id: Optional[int] = None
+    supplier_id: Optional[int] = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v):
+        if not v[0].isupper():
+            raise ValueError("Name must start with a capital letter")
+        if not re.fullmatch(r"[A-Za-z0-9\s\-]+", v):
+            raise ValueError("Name cannot contain special characters")
+        return v
+
+    @field_validator("brand")
+    @classmethod
+    def validate_brand(cls, v):
+        allowed = {
+            "HP": "HP",
+            "DELL": "Dell",
+            "LENOVO": "Lenovo",
+            "APPLE": "Apple",
+            "SAMSUNG": "Samsung",
+            "INTEL": "Intel",
+            "AMD": "AMD",
+            "CORSAIR": "Corsair",
+            "LOGITECH": "Logitech",
+            "OTHER": "Other",
+        }
+
+        key = v.strip().upper()
+
+        if key not in allowed:
+            raise ValueError("Invalid brand")
+
+        return allowed[key]
+
+    @field_validator("category")
+    @classmethod
+    def validate_category(cls, v):
+        allowed = {
+            "laptops": "Laptops",
+            "monitors": "Monitors",
+            "storage": "Storage",
+            "processors": "Processors",
+            "memory": "Memory",
+            "keyboards": "Keyboards",
+            "mice": "Mice",
+            "accessories": "Accessories",
+        }
+
+        key = v.lower().strip()
+
+        if key not in allowed:
+            raise ValueError("Invalid category")
+
+        return allowed[key]
+
+    @field_validator("price")
+    @classmethod
+    def validate_price(cls, v):
+        if round(v,2) != v:
+            raise ValueError("Price must have at most 2 decimal places")
+
+        if v < 100 or v > 500000:
+            raise ValueError("Price must be between 100 and 500000")
+
+        return round(v,2)
+
+    @field_validator("sku")
+    @classmethod
+    def validate_sku(cls,v):
+        if not re.fullmatch(r"^[A-Z]{3,4}-[A-Z]{2,4}-[0-9]{4}$",v):
+            raise ValueError("Invalid SKU")
+
+        valid={"LAP","MON","STO","PRO","MEM","KEY","MOU","ACC"}
+
+        if v.split("-")[0] not in valid:
+            raise ValueError("Invalid SKU category")
+
+        return v
+
+    @model_validator(mode="after")
+    def validate_warranty(self):
+
+        if self.warranty_months>36:
+            raise ValueError("Warranty cannot exceed 36 months")
+
+        if self.price>50000 and self.warranty_months<12:
+            raise ValueError("Products above KSh 50,000 require at least 12 months warranty")
+
+        return self
+2. Supplier Model and Validation (15%)
+class Supplier(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+
+    name: str = Field(unique=True,index=True)
+    contact_person: str
+    email: EmailStr = Field(unique=True,index=True)
+    phone: str
+    is_active: bool=True
+
+    products: List["Product"]=Relationship(back_populates="supplier_rel")
+class SupplierCreate(SQLModel):
+    name:str
+    contact_person:str
+    email:EmailStr
+    phone:str
+    is_active:bool=True
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls,v):
+        if not re.fullmatch(r"^\+?[0-9]{10,15}$",v):
+            raise ValueError("Invalid phone number")
+        return v
+3. Bulk Update Endpoint (15%)
+@app.patch("/products/bulk-update")
+def bulk_update(
+    category:str,
+    discount_percent:float,
+    session:Session=Depends(get_session)
+):
+
+    if not 0<discount_percent<=100:
+        raise HTTPException(400,"Discount must be between 0 and 100")
+
+    products=session.exec(
+        select(Product).where(Product.category==category)
+    ).all()
+
+    updated=0
+
+    for product in products:
+
+        new_price=round(
+            product.price*(1-discount_percent/100),
+            2
+        )
+
+        if new_price<100:
+            continue
+
+        product.price=new_price
+        updated+=1
+
+    session.commit()
+
+    logger.info(f"Updated {updated} products")
+
+    return {
+        "updated_products":updated,
+        "discount":discount_percent
+    }
+4. Stock Adjustment Endpoint (15%)
+class StockAdjustment(SQLModel):
+    product_id:int
+    quantity_to_add:int=Field(gt=0)
+@app.patch("/products/adjust-stock")
+def adjust_stock(
+    adjustments:list[StockAdjustment],
+    session:Session=Depends(get_session)
+):
+
+    success=[]
+    failed=[]
+
+    for item in adjustments:
+
+        product=session.get(Product,item.product_id)
+
+        if not product:
+            failed.append({
+                "product_id":item.product_id,
+                "reason":"Product not found"
+            })
+            continue
+
+        new_stock=product.stock+item.quantity_to_add
+
+        if new_stock>5000:
+            failed.append({
+                "product_id":item.product_id,
+                "reason":"Stock exceeds maximum limit"
+            })
+            continue
+
+        product.stock=new_stock
+
+        success.append({
+            "product_id":item.product_id,
+            "new_stock":new_stock
+        })
+
+    session.commit()
+
+    return{
+        "successful_updates":success,
+        "failed_updates":failed
+    }
+5. Exception Handlers (15%)
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request:Request,exc:HTTPException):
+
+    logger.warning(exc.detail)
+
+    return error_response(
+        exc.status_code,
+        exc.detail,
+        request.url.path
+    )
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request:Request,
+    exc:RequestValidationError
+):
+
+    errors=[]
+
+    for error in exc.errors():
+        errors.append({
+            "field":".".join(map(str,error["loc"])),
+            "message":error["msg"],
+            "type":error["type"]
+        })
+
+    return error_response(
+        422,
+        "Validation error",
+        request.url.path,
+        errors
+    )
+@app.exception_handler(IntegrityError)
+async def integrity_exception_handler(
+    request:Request,
+    exc:IntegrityError
+):
+
+    logger.error(str(exc))
+
+    return error_response(
+        409,
+        "Duplicate SKU or database constraint violation",
+        request.url.path
+    )
+@app.exception_handler(Exception)
+async def general_exception_handler(
+    request:Request,
+    exc:Exception
+):
+
+    logger.exception(exc)
+
+    return error_response(
+        500,
+        "Internal server error",
+        request.url.path
+    )
